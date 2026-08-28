@@ -25,16 +25,24 @@ INPUT_FILE = "data_tiang.csv"     # nama file csv tiang yang sudah di-upload
 
 MIN_CLUSTER_SIZE = 10             # brp tiang minimal supaya layak disebut "titik keramaian" -- ini
                                    # KEPUTUSAN BISNIS, bukan statistik murni. Naikkan buat lebih strict.
-MIN_SAMPLES = 3                   # makin gede -> makin galak nandain noise. Sebaran tiang itu MEMANJANG
+MIN_SAMPLES = 1                   # makin gede -> makin galak nandain noise. Sebaran tiang itu MEMANJANG
                                    # ngikutin jalan (bukan blobby kayak data pada umumnya), makanya
-                                   # dipakai KECIL (2-4) -- min_samples gede (10+) bikin ujung-ujung baris
-                                   # tiang yg padat sekalipun kecap noise semua krn tetangga di arah
-                                   # TEGAK LURUS jalan emang dikit.
-CLUSTER_SELECTION_EPSILON_M = 250.0  # gabungin cluster yg jaraknya < ini (dalam METER) -- cegah 1
+                                   # dipakai SEKECIL MUNGKIN (1-2) -- min_samples gede (10+) bikin
+                                   # ujung-ujung baris tiang yg padat sekalipun kecap noise semua krn
+                                   # tetangga di arah TEGAK LURUS jalan emang dikit.
+CLUSTER_SELECTION_EPSILON_M = 800.0  # gabungin cluster yg jaraknya < ini (dalam METER) -- cegah 1
                                    # kelurahan kepecah jadi belasan cluster kecil gara-gara dikit putus
-                                   # di persimpangan/gang.
+                                   # di persimpangan/gang. Divalidasi: makin gede angka ini + MIN_SAMPLES
+                                   # kecil, DBCV (validitas cluster) justru NAIK -- bukan cuma "keliatan
+                                   # lebih bersih" doang.
 CLUSTER_SELECTION_METHOD = 'eom'  # 'eom' -> cluster gede & stabil (dipakai di sini, analisa regional
                                    # skala besar). 'leaf' -> lebih granular/detail per area kecil.
+
+# PENTING (ketauan pas ngecek manual): titik yg keliatan "di dalam" area padat di plot skala regional
+# BELUM TENTU beneran deket -- di plot yg meliputi ratusan km, gap 1-3km cuma keliatan seuprit padahal
+# itu jarak asli antar jalan/kompleks yg beda. Sebelum ubah MIN_SAMPLES/EPSILON lebih jauh, ZOOM IN dulu
+# ke titik yg dicurigai & cek jarak aslinya (lihat percakapan/analisa) -- kalau makin dilonggarin gak
+# ngefek, itu tandanya emang jauh beneran, bukan soal parameter.
 
 # Definisi "outer" disusun BERLAPIS (biar gampang dijelasin ke stakeholder), bukan 1 kriteria doang:
 #
@@ -48,9 +56,16 @@ CLUSTER_SELECTION_METHOD = 'eom'  # 'eom' -> cluster gede & stabil (dipakai di s
 #                     kasus yang HDBSCAN gak bisa nangkep sendiri: cluster yang PADAT SECARA LOKAL
 #                     (makanya gak kena noise) tapi kepencil jauh dari jaringan padat manapun -- paling
 #                     gampang dipertanggungjawabkan ke tim lapangan krn satuannya konkret (km).
+#  Layer 4 RESCUE JARAK KECIL -> BARU. Titik NOISE (Layer 1) yang jaraknya ke cluster valid manapun
+#                     masih <= JARAK_RESCUE_DEKAT_KM diselamatkan balik jadi Inner. Ini KEBIJAKAN BISNIS
+#                     eksplisit, BUKAN soal kepadatan lagi -- dipakai kalau kamu tetap mau titik yg gak
+#                     padat lokal tapi masih deket (radius kecil) ke jaringan dianggap Inner. Beda sama
+#                     Layer 3: Layer 3 buat cluster PADAT yg kepencil JAUH (>10km), Layer 4 buat titik
+#                     TUNGGAL/NOISE yg deket (radius kecil, default 2km). Set None buat matiin layer ini.
 PERSENTIL_OUTLIER_LUNAK = 90
 JARAK_ATURAN_BISNIS_KM = 10.0
 BATAS_MANDIRI_TERISOLASI = 150
+JARAK_RESCUE_DEKAT_KM = 2.0
 
 K_TETANGGA_CORE_DISTANCE = 10     # k tetangga buat "core distance" -- estimator kepadatan lokal murah
                                    # per titik (dari sklearn NearestNeighbors, bukan hdbscan internal),
@@ -254,8 +269,8 @@ def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
 def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
                            MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
                            PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI,
-                           K_TETANGGA_CORE_DISTANCE):
-    """Jalankan HDBSCAN + kategorisasi 3-lapis untuk 1 subset regional saja.
+                           K_TETANGGA_CORE_DISTANCE, JARAK_RESCUE_DEKAT_KM=None):
+    """Jalankan HDBSCAN + kategorisasi 4-lapis untuk 1 subset regional saja.
 
     CATATAN PROYEKSI: jarak dihitung di ruang UTM (meter), BUKAN langsung di derajat lat/lon --
     supaya eps/core-distance/jarak aturan-bisnis semua kebaca dalam satuan yang konsisten & gak
@@ -275,6 +290,12 @@ def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
                       BATAS_MANDIRI_TERISOLASI. Ini WAJIB ada di luar HDBSCAN sendiri, karena HDBSCAN
                       cuma peduli KEPADATAN LOKAL -- cluster yang padat secara lokal tapi kepencil
                       jauh dari jaringan padat manapun TETAP dianggap cluster valid oleh HDBSCAN.
+    Layer 4 RESCUE JARAK KECIL = titik noise (Layer 1) yang jaraknya ke cluster valid manapun masih
+                      <= JARAK_RESCUE_DEKAT_KM diselamatkan balik jadi Inner. PENTING: divalidasi
+                      manual (lihat catatan parameter) -- titik yang keliatan "nempel" ke area padat
+                      di plot skala regional itu SERING kali beneran berjarak ratusan meter-beberapa km
+                      (cuma keliatan deket krn plotnya meliputi ratusan km). Jadi ini murni KEBIJAKAN
+                      BISNIS ("masih radius segini dianggap 1 area"), bukan koreksi kepadatan lagi.
     """
     df_r = df_r.reset_index(drop=True)
 
@@ -387,13 +408,31 @@ def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
         ambang_lunak = np.percentile(glosh_scores[kandidat_lunak], PERSENTIL_OUTLIER_LUNAK)
         is_soft_outlier = kandidat_lunak & (glosh_scores >= ambang_lunak)
 
-    # 7. Gabungin jadi Kategori_Propagasi final
+    # 7. LAYER 4 (RESCUE JARAK KECIL): titik noise yang masih deket (<= JARAK_RESCUE_DEKAT_KM) ke
+    #    cluster valid manapun (root/Sub-Cluster Valid/Soft Outlier -- pokoknya bukan noise) diselamatkan
+    #    balik jadi Inner. KEBIJAKAN BISNIS eksplisit, lihat catatan di docstring & parameter.
+    is_rescued = np.zeros(n, dtype=bool)
+    if JARAK_RESCUE_DEKAT_KM is not None and is_noise.any():
+        mask_acuan_rescue = ~is_noise  # semua yg BUKAN noise = acuan "masih deket jaringan"
+        if mask_acuan_rescue.any():
+            kdt_acuan = KDTree(coords_m[mask_acuan_rescue])
+            idx_noise = np.where(is_noise)[0]
+            JARAK_RESCUE_M = JARAK_RESCUE_DEKAT_KM * 1000.0
+            d_rescue, _ = kdt_acuan.query(coords_m[idx_noise], k=1)
+            is_rescued[idx_noise[d_rescue <= JARAK_RESCUE_M]] = True
+    n_rescue = int(is_rescued.sum())
+    if n_rescue > 0:
+        print(f"      🔎 Layer 4 (Rescue Jarak Kecil): {n_rescue} tiang noise yang ternyata masih "
+              f"<= {JARAK_RESCUE_DEKAT_KM} km dari cluster valid manapun -> diselamatkan jadi Inner.")
+
+    # 8. Gabungin jadi Kategori_Propagasi final
     kategori = np.where(
         labels == root_label, 'Main Network (Root)',
+        np.where(is_rescued, 'Sub-Cluster Valid (Rescue - Dekat Cluster)',
         np.where(is_noise, 'Outlier (Noise - HDBSCAN)',
         np.where(is_bisnis_outlier, 'Outlier (Aturan Bisnis - Terisolasi)',
         np.where(is_soft_outlier, 'Sub-Cluster Valid (Soft Outlier - Pinggiran)',
-        'Sub-Cluster Valid')))
+        'Sub-Cluster Valid'))))
     )
     df_aktif['Kategori_Propagasi'] = kategori
 
@@ -418,7 +457,8 @@ for reg in daftar_regional_proses:
     df_r, root_point, dbcv = analisa_satu_regional(
         df_r, stort_final[reg], reg, stort_dikecualikan_final[reg],
         MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
-        PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI, K_TETANGGA_CORE_DISTANCE
+        PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI, K_TETANGGA_CORE_DISTANCE,
+        JARAK_RESCUE_DEKAT_KM
     )
     # cluster_id dibikin unik lintas regional biar gak ketuker pas digabung nanti
     df_r['cluster_id'] = reg + "_" + df_r['cluster_id'].astype(str)
@@ -426,6 +466,7 @@ for reg in daftar_regional_proses:
     n_main = (df_r['Kategori_Propagasi'] == 'Main Network (Root)').sum()
     n_sub = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid').sum()
     n_lunak = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid (Soft Outlier - Pinggiran)').sum()
+    n_rescue = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid (Rescue - Dekat Cluster)').sum()
     n_bisnis = (df_r['Kategori_Propagasi'] == 'Outlier (Aturan Bisnis - Terisolasi)').sum()
     n_noise = (df_r['Kategori_Propagasi'] == 'Outlier (Noise - HDBSCAN)').sum()
     n_diblokir = (df_r['Kategori_Propagasi'] == '🚫 Dikecualikan (Blacklist Stort)').sum()
@@ -438,6 +479,9 @@ for reg in daftar_regional_proses:
     if n_lunak > 0:
         print(f"   -> Sub-Cluster Valid (Soft Outlier / Pinggiran) : {n_lunak} tiang "
               f"(GLOSH >= persentil {PERSENTIL_OUTLIER_LUNAK}, tetap Inner tapi ditandai)")
+    if n_rescue > 0:
+        print(f"   -> Sub-Cluster Valid (Rescue - Dekat Cluster)   : {n_rescue} tiang "
+              f"(noise yg diselamatkan, masih <= {JARAK_RESCUE_DEKAT_KM} km ke cluster valid)")
     print(f"   -> Outlier (Aturan Bisnis - Terisolasi)       : {n_bisnis} tiang")
     print(f"   -> Outlier (Noise - HDBSCAN)                  : {n_noise} tiang")
     if n_invalid > 0:
@@ -463,6 +507,7 @@ warna = {
     'Main Network (Root)': '#3498db',
     'Sub-Cluster Valid': '#2ecc71',
     'Sub-Cluster Valid (Soft Outlier - Pinggiran)': '#f39c12',
+    'Sub-Cluster Valid (Rescue - Dekat Cluster)': '#1abc9c',
     'Outlier (Aturan Bisnis - Terisolasi)': '#9b59b6',
     'Outlier (Noise - HDBSCAN)': '#e74c3c',
     '❌ Koordinat Tidak Valid': '#2c3e50',
@@ -470,7 +515,8 @@ warna = {
 }
 ukuran = {
     'Main Network (Root)': 15, 'Sub-Cluster Valid': 22,
-    'Sub-Cluster Valid (Soft Outlier - Pinggiran)': 22, 'Outlier (Aturan Bisnis - Terisolasi)': 28,
+    'Sub-Cluster Valid (Soft Outlier - Pinggiran)': 22, 'Sub-Cluster Valid (Rescue - Dekat Cluster)': 22,
+    'Outlier (Aturan Bisnis - Terisolasi)': 28,
     'Outlier (Noise - HDBSCAN)': 25, '❌ Koordinat Tidak Valid': 30, '🚫 Dikecualikan (Blacklist Stort)': 18,
 }
 KAT_ATAS = ('Outlier (Aturan Bisnis - Terisolasi)', 'Outlier (Noise - HDBSCAN)',
