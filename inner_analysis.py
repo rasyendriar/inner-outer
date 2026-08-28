@@ -17,15 +17,28 @@ MIN_TIANG_SUBCLUSTER = 5          # minimal jumlah tiang supaya sekumpulan tiang
                                    # "sub-cluster valid" (network kecil yg tetap solid), bukan outlier acak
 
 # BARU: koreksi tahap-2 pakai TEKNIK PENCARIAN JARAK (KDTree) ala Code 2 (inner_outer_choose.py).
-# Masalah sebelumnya: connected-components dgn radius KAKU (RADIUS_SCAN_KM) bisa motong sekumpulan
-# tiang jadi komponen kecil (< MIN_TIANG_SUBCLUSTER) walau posisinya masih MENEMPEL/dekat ke area
-# padat (Main Network / Sub-Cluster Valid) -> ke-cap "Outlier" padahal sebenernya masih "nempel".
-# Fix: tiang yang divonis Outlier dicek ULANG jaraknya (KDTree, bukan sekedar graf-terhubung) ke
-# tiang padat TERDEKAT. Kalau jaraknya <= JARAK_DEKAT_PADAT_KM -> dianggap masih "di area padat",
-# direklasifikasi jadi Inner. Kalau jauh (dan emang dikit tiangnya) -> tetap Outlier beneran.
-# Set None atau <= RADIUS_SCAN_KM buat MATIKAN koreksi ini (balik ke perilaku lama, murni radius kaku).
-JARAK_DEKAT_PADAT_KM = 2.0        # biasanya diisi LEBIH BESAR dari RADIUS_SCAN_KM (nyari lebih jauh
+# Ada 2 masalah yang diperbaiki di sini (ketauan pas ngecek manual hasil plot R045-JABOJABAR):
+#
+#  MASALAH A - tiang "nempel" ke area padat malah kecap Outlier:
+#  connected-components dgn radius KAKU (RADIUS_SCAN_KM) bisa motong sekumpulan tiang jadi komponen
+#  kecil (< MIN_TIANG_SUBCLUSTER) walau posisinya masih MENEMPEL/dekat ke area padat (Main Network /
+#  Sub-Cluster Valid). Fix: tiang yang divonis Outlier dicek ULANG jaraknya (KDTree) ke tiang padat
+#  TERDEKAT. Kalau jaraknya <= JARAK_DEKAT_PADAT_KM -> direklasifikasi jadi Inner.
+#
+#  MASALAH B - komponen yg KEBETULAN >= MIN_TIANG_SUBCLUSTER tapi BENERAN KEPENCIL SENDIRIAN:
+#  sebaliknya, MIN_TIANG_SUBCLUSTER doang gak cukup -- komponen yg padat SECARA LOKAL (misal 59 tiang
+#  numpuk rapet) tapi lokasinya keliatan dari SEMUA jaringan lain (puluhan km, gak nempel kemana-mana)
+#  sebelumnya lolos otomatis jadi "Sub-Cluster Valid" padahal ini persis "outlier" yg dimaksud: terisolasi
+#  DAN jauh dari pusat tiang-tiang padat manapun. Fix: komponen yg jaraknya ke SEMUA komponen lain lebih
+#  jauh dari JARAK_TERISOLASI_KM diturunin ke Outlier, KECUALI ukurannya sendiri udah >= BATAS_MANDIRI_TERISOLASI
+#  (segede itu, dianggap emang jaringan/kota lain yg sah, walau posisinya jauh sendirian).
+#
+# Set JARAK_DEKAT_PADAT_KM None/<=RADIUS_SCAN_KM buat matiin Masalah A, atau JARAK_TERISOLASI_KM None
+# buat matiin Masalah B (balik ke perilaku lama, murni radius kaku + MIN_TIANG_SUBCLUSTER).
+JARAK_DEKAT_PADAT_KM = 5.0        # biasanya diisi LEBIH BESAR dari RADIUS_SCAN_KM (nyari lebih jauh
                                    # drpd radius connectivity, itu intinya) -- mainkan sesuai kepadatan datamu
+JARAK_TERISOLASI_KM = 10.0        # di atas jarak ini ke komponen LAIN manapun -> dianggap "beneran kepencil"
+BATAS_MANDIRI_TERISOLASI = 150    # kecuali ukuran komponennya sendiri >= ini -> tetep Sub-Cluster Valid
 
 # analisa dipecah per kolom 'regional', bukan digabung jadi 1 peta besar.
 # Root/jangkar, radius propagasi, dan kategorisasi dihitung SENDIRI-SENDIRI tiap regional,
@@ -33,7 +46,7 @@ JARAK_DEKAT_PADAT_KM = 2.0        # biasanya diisi LEBIH BESAR dari RADIUS_SCAN_
 # MODE_REGIONAL = 'SATU'  -> cuma proses 1 regional yang kamu pilih di REGIONAL_TERPILIH
 # MODE_REGIONAL = 'SEMUA' -> loop SEMUA regional sekaligus
 MODE_REGIONAL = 'SEMUA'
-REGIONAL_TERPILIH = 'R06 JAWA TENGAH'   # dipakai kalau MODE_REGIONAL = 'SATU'
+REGIONAL_TERPILIH = 'R045-JABOJABAR'    # dipakai kalau MODE_REGIONAL = 'SATU'
 
 # BARU: kontrol titik awal (seed/jangkar "Main Network"), berdasarkan kolom 'stort'.
 # MODE_SEED = 'OTOMATIS'    -> BARU: prioritaskan STORT dengan jumlah TIANG PALING BANYAK dulu,
@@ -202,7 +215,7 @@ def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
 
 
 def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pilihan, reg_name, stort_dikecualikan,
-                           JARAK_DEKAT_PADAT_KM=None):
+                           JARAK_DEKAT_PADAT_KM=None, JARAK_TERISOLASI_KM=None, BATAS_MANDIRI_TERISOLASI=150):
     """Jalankan seluruh logika propagasi & kategorisasi untuk 1 subset regional saja.
 
     CATATAN PERFORMA: connected-components dibangun dari pasangan tetangga SATU ARAH saja
@@ -214,14 +227,25 @@ def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pili
     CATATAN BLACKLIST: tiang dari STORT yang dikecualikan dikeluarkan SEBELUM KDTree/graf dibangun,
     jadi mereka gak bisa jadi "jembatan" yang nyambungin 2 cluster yang harusnya terpisah.
 
-    CATATAN KOREKSI TAHAP-2 (ala Code 2 / inner_outer_choose.py): connected-components pakai radius
-    KAKU, jadi sekumpulan tiang yang padat bisa aja kepotong jadi komponen kecil kalau kebetulan
-    "loncatannya" dikit di atas RADIUS_SCAN_KM. Padahal kalau posisinya masih nempel/dekat ke area
-    padat, harusnya tetap Inner, bukan Outlier. Makanya tiap tiang yang divonis "Outlier (Terputus)"
-    di step 3 dicek ULANG jaraknya (pakai KDTree.query, teknik pencarian jarak-terdekat yang sama
-    kayak dipakai buat nyari span di Code 2) ke tiang padat TERDEKAT (Main Network / Sub-Cluster
-    Valid). Deket (<= JARAK_DEKAT_PADAT_KM) -> diselamatkan jadi Inner. Jauh (dan emang dikit
-    tiangnya, itu makanya jadi Outlier dari awal) -> tetap Outlier beneran.
+    CATATAN KOREKSI (ala Code 2 / inner_outer_choose.py) -- 2 tahap, lihat juga catatan parameter
+    JARAK_DEKAT_PADAT_KM / JARAK_TERISOLASI_KM / BATAS_MANDIRI_TERISOLASI di bagian atas file:
+
+    Tahap 3a (turunin komponen yg KEPENCIL SENDIRIAN): komponen yg >= MIN_TIANG_SUBCLUSTER (jadi
+    lolos jadi 'Sub-Cluster Valid' di step 3) tapi jaraknya ke SEMUA komponen lain lebih jauh dari
+    JARAK_TERISOLASI_KM diturunin jadi 'Outlier (Terputus)' -- KECUALI ukurannya sendiri udah
+    >= BATAS_MANDIRI_TERISOLASI. Ini dicek pakai graf connected-components KEDUA yg radiusnya jauh
+    lebih gede (JARAK_TERISOLASI_KM) drpd RADIUS_SCAN_KM: kalau komponen si tiang di graf-gede ini
+    ukurannya SAMA PERSIS kayak komponen di graf-kecil (RADIUS_SCAN_KM), artinya emang gak ada
+    komponen lain manapun yg nyambung/deket bahkan di radius segede itu -> beneran kepencil sendirian.
+
+    Tahap 3b (selamatin komponen yg NEMPEL ke area padat): kebalikannya -- komponen kecil (< MIN_TIANG_
+    SUBCLUSTER, atau abis diturunin di 3a) yg ternyata masih deket (<= JARAK_DEKAT_PADAT_KM, dicek pakai
+    KDTree.query, teknik pencarian jarak-terdekat yg sama kayak dipakai nyari span di Code 2) ke tiang
+    padat (Main Network / Sub-Cluster Valid) TERDEKAT, diselamatkan balik jadi Inner.
+
+    Intinya niru definisi "outlier beneran" = terisolasi DAN jauh dari pusat tiang padat manapun
+    (3a) DAN dikit tiangnya (gagal MIN_TIANG_SUBCLUSTER atau BATAS_MANDIRI_TERISOLASI) -- tapi begitu
+    dia masih nempel ke area padat (3b), tetap dianggap Inner.
     """
     df_r = df_r.reset_index(drop=True)
 
@@ -275,7 +299,40 @@ def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pili
         np.where(jml_cluster_arr >= MIN_TIANG_SUBCLUSTER, 'Sub-Cluster Valid', 'Outlier (Terputus)')
     )
 
-    # 3b. KOREKSI TAHAP-2 -- teknik pencarian jarak (KDTree) ala Code 2, lihat catatan di docstring.
+    # 3a. TURUNIN komponen yang KEPENCIL SENDIRIAN, lihat catatan di docstring.
+    # Cuma jalan kalau JARAK_TERISOLASI_KM diisi & lebih besar dari RADIUS_SCAN_KM.
+    if JARAK_TERISOLASI_KM is not None and JARAK_TERISOLASI_KM > RADIUS_SCAN_KM:
+        JARAK_TERISOLASI_DEG = JARAK_TERISOLASI_KM / 111.0
+        pairs_isolasi = kdtree.query_pairs(r=JARAK_TERISOLASI_DEG, output_type='ndarray')
+        if len(pairs_isolasi) > 0:
+            graph_isolasi = coo_matrix(
+                (np.ones(len(pairs_isolasi)), (pairs_isolasi[:, 0], pairs_isolasi[:, 1])), shape=(n, n)
+            )
+        else:
+            graph_isolasi = coo_matrix((n, n))
+        _, labels_isolasi = connected_components(csgraph=graph_isolasi, directed=False)
+        pulau_sizes = pd.Series(labels_isolasi).value_counts()
+        jml_pulau_arr = pd.Series(labels_isolasi).map(pulau_sizes).to_numpy()
+
+        kategori_arr = df_aktif['Kategori_Propagasi'].to_numpy()
+        # "kepencil sendirian" = ukuran pulau (radius jauh) SAMA PERSIS kayak ukuran cluster (radius
+        # kecil) -> gak ada komponen lain manapun yang nyambung bahkan di radius sejauh itu.
+        mask_kepencil = (
+            (kategori_arr == 'Sub-Cluster Valid')
+            & (jml_pulau_arr == jml_cluster_arr)
+            & (jml_cluster_arr < BATAS_MANDIRI_TERISOLASI)
+        )
+        n_diturunkan = int(mask_kepencil.sum())
+        if n_diturunkan > 0:
+            kategori_arr = kategori_arr.copy()
+            kategori_arr[mask_kepencil] = 'Outlier (Terputus)'
+            df_aktif['Kategori_Propagasi'] = kategori_arr
+            print(f"      📉 Koreksi isolasi (ala Code 2): {n_diturunkan} tiang yang tadinya "
+                  f"'Sub-Cluster Valid' ternyata > {JARAK_TERISOLASI_KM} km dari komponen manapun & "
+                  f"< {BATAS_MANDIRI_TERISOLASI} tiang -> diturunkan jadi Outlier (kepencil sendirian).")
+
+    # 3b. SELAMATIN komponen yang NEMPEL ke area padat -- teknik pencarian jarak (KDTree) ala Code 2,
+    # lihat catatan di docstring.
     # Hanya jalan kalau JARAK_DEKAT_PADAT_KM diisi & lebih besar dari RADIUS_SCAN_KM (kalau lebih
     # kecil/sama, gak akan pernah nemu apa-apa karena titik segitu deketnya udah pasti KESAMBUNG
     # dari step 1 & gak akan pernah kecap Outlier duluan).
@@ -320,7 +377,7 @@ for reg in daftar_regional_proses:
     print(f"📍 Regional: {reg}  (total {len(df_r)} tiang)")
     df_r, root_point = analisa_satu_regional(
         df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_final[reg], reg, stort_dikecualikan_final[reg],
-        JARAK_DEKAT_PADAT_KM
+        JARAK_DEKAT_PADAT_KM, JARAK_TERISOLASI_KM, BATAS_MANDIRI_TERISOLASI
     )
     # cluster_id dibikin unik lintas regional biar gak ketuker pas digabung nanti
     df_r['cluster_id'] = reg + "_" + df_r['cluster_id'].astype(str)
