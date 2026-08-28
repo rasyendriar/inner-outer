@@ -16,6 +16,17 @@ RADIUS_SCAN_KM = 1.0              # Jarak maksimal loncatan antar tiang/cluster 
 MIN_TIANG_SUBCLUSTER = 5          # minimal jumlah tiang supaya sekumpulan tiang dianggap
                                    # "sub-cluster valid" (network kecil yg tetap solid), bukan outlier acak
 
+# BARU: koreksi tahap-2 pakai TEKNIK PENCARIAN JARAK (KDTree) ala Code 2 (inner_outer_choose.py).
+# Masalah sebelumnya: connected-components dgn radius KAKU (RADIUS_SCAN_KM) bisa motong sekumpulan
+# tiang jadi komponen kecil (< MIN_TIANG_SUBCLUSTER) walau posisinya masih MENEMPEL/dekat ke area
+# padat (Main Network / Sub-Cluster Valid) -> ke-cap "Outlier" padahal sebenernya masih "nempel".
+# Fix: tiang yang divonis Outlier dicek ULANG jaraknya (KDTree, bukan sekedar graf-terhubung) ke
+# tiang padat TERDEKAT. Kalau jaraknya <= JARAK_DEKAT_PADAT_KM -> dianggap masih "di area padat",
+# direklasifikasi jadi Inner. Kalau jauh (dan emang dikit tiangnya) -> tetap Outlier beneran.
+# Set None atau <= RADIUS_SCAN_KM buat MATIKAN koreksi ini (balik ke perilaku lama, murni radius kaku).
+JARAK_DEKAT_PADAT_KM = 2.0        # biasanya diisi LEBIH BESAR dari RADIUS_SCAN_KM (nyari lebih jauh
+                                   # drpd radius connectivity, itu intinya) -- mainkan sesuai kepadatan datamu
+
 # analisa dipecah per kolom 'regional', bukan digabung jadi 1 peta besar.
 # Root/jangkar, radius propagasi, dan kategorisasi dihitung SENDIRI-SENDIRI tiap regional,
 # supaya tiang di Jateng gak nyambung/ketimpuk sama tiang di Jatim misalnya.
@@ -190,7 +201,8 @@ def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
     return mask
 
 
-def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pilihan, reg_name, stort_dikecualikan):
+def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pilihan, reg_name, stort_dikecualikan,
+                           JARAK_DEKAT_PADAT_KM=None):
     """Jalankan seluruh logika propagasi & kategorisasi untuk 1 subset regional saja.
 
     CATATAN PERFORMA: connected-components dibangun dari pasangan tetangga SATU ARAH saja
@@ -201,6 +213,15 @@ def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pili
 
     CATATAN BLACKLIST: tiang dari STORT yang dikecualikan dikeluarkan SEBELUM KDTree/graf dibangun,
     jadi mereka gak bisa jadi "jembatan" yang nyambungin 2 cluster yang harusnya terpisah.
+
+    CATATAN KOREKSI TAHAP-2 (ala Code 2 / inner_outer_choose.py): connected-components pakai radius
+    KAKU, jadi sekumpulan tiang yang padat bisa aja kepotong jadi komponen kecil kalau kebetulan
+    "loncatannya" dikit di atas RADIUS_SCAN_KM. Padahal kalau posisinya masih nempel/dekat ke area
+    padat, harusnya tetap Inner, bukan Outlier. Makanya tiap tiang yang divonis "Outlier (Terputus)"
+    di step 3 dicek ULANG jaraknya (pakai KDTree.query, teknik pencarian jarak-terdekat yang sama
+    kayak dipakai buat nyari span di Code 2) ke tiang padat TERDEKAT (Main Network / Sub-Cluster
+    Valid). Deket (<= JARAK_DEKAT_PADAT_KM) -> diselamatkan jadi Inner. Jauh (dan emang dikit
+    tiangnya, itu makanya jadi Outlier dari awal) -> tetap Outlier beneran.
     """
     df_r = df_r.reset_index(drop=True)
 
@@ -254,6 +275,31 @@ def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pili
         np.where(jml_cluster_arr >= MIN_TIANG_SUBCLUSTER, 'Sub-Cluster Valid', 'Outlier (Terputus)')
     )
 
+    # 3b. KOREKSI TAHAP-2 -- teknik pencarian jarak (KDTree) ala Code 2, lihat catatan di docstring.
+    # Hanya jalan kalau JARAK_DEKAT_PADAT_KM diisi & lebih besar dari RADIUS_SCAN_KM (kalau lebih
+    # kecil/sama, gak akan pernah nemu apa-apa karena titik segitu deketnya udah pasti KESAMBUNG
+    # dari step 1 & gak akan pernah kecap Outlier duluan).
+    if JARAK_DEKAT_PADAT_KM is not None and JARAK_DEKAT_PADAT_KM > RADIUS_SCAN_KM:
+        kategori_arr = df_aktif['Kategori_Propagasi'].to_numpy()
+        mask_padat = np.isin(kategori_arr, ['Main Network (Root)', 'Sub-Cluster Valid'])
+        mask_outlier_awal = kategori_arr == 'Outlier (Terputus)'
+
+        if mask_padat.any() and mask_outlier_awal.any():
+            kdtree_padat = KDTree(coords[mask_padat])
+            JARAK_DEKAT_DEG = JARAK_DEKAT_PADAT_KM / 111.0
+            idx_outlier = np.where(mask_outlier_awal)[0]
+            dist_ke_padat, _ = kdtree_padat.query(coords[idx_outlier], k=1)
+            dekat_ke_padat = dist_ke_padat <= JARAK_DEKAT_DEG
+
+            n_diselamatkan = int(dekat_ke_padat.sum())
+            if n_diselamatkan > 0:
+                kategori_arr = kategori_arr.copy()
+                kategori_arr[idx_outlier[dekat_ke_padat]] = 'Sub-Cluster Valid (Dekat Jaringan Padat)'
+                df_aktif['Kategori_Propagasi'] = kategori_arr
+                print(f"      🔎 Koreksi jarak (ala Code 2): {n_diselamatkan} tiang yang tadinya "
+                      f"'Outlier (Terputus)' ternyata masih <= {JARAK_DEKAT_PADAT_KM} km dari jaringan "
+                      f"padat -> direklasifikasi jadi Inner ('Sub-Cluster Valid (Dekat Jaringan Padat)').")
+
     root_point = coords[best_start_idx].copy()  # simpan KOORDINAT (bukan index, karena index berubah pas digabung)
 
     if len(df_diblokir) > 0:
@@ -273,20 +319,25 @@ for reg in daftar_regional_proses:
     df_r = df[df['regional'] == reg].copy()
     print(f"📍 Regional: {reg}  (total {len(df_r)} tiang)")
     df_r, root_point = analisa_satu_regional(
-        df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_final[reg], reg, stort_dikecualikan_final[reg]
+        df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_final[reg], reg, stort_dikecualikan_final[reg],
+        JARAK_DEKAT_PADAT_KM
     )
     # cluster_id dibikin unik lintas regional biar gak ketuker pas digabung nanti
     df_r['cluster_id'] = reg + "_" + df_r['cluster_id'].astype(str)
 
     n_main = (df_r['Kategori_Propagasi'] == 'Main Network (Root)').sum()
     n_sub = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid').sum()
+    n_dekat_padat = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid (Dekat Jaringan Padat)').sum()
     n_outlier = (df_r['Kategori_Propagasi'] == 'Outlier (Terputus)').sum()
     n_diblokir = (df_r['Kategori_Propagasi'] == '🚫 Dikecualikan (Blacklist Stort)').sum()
     n_sub_clusters = df_r.loc[df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid', 'cluster_id'].nunique()
 
     print(f"   -> Main Network (Root)                : {n_main} tiang")
     print(f"   -> Sub-Cluster Valid (>= {MIN_TIANG_SUBCLUSTER} tiang) : {n_sub} tiang ({n_sub_clusters} cluster)")
-    print(f"   -> Outlier (Terputus / < {MIN_TIANG_SUBCLUSTER} tiang)  : {n_outlier} tiang")
+    if n_dekat_padat > 0:
+        print(f"   -> Sub-Cluster Valid (Dekat Jaringan Padat) : {n_dekat_padat} tiang "
+              f"(diselamatkan dari Outlier, masih <= {JARAK_DEKAT_PADAT_KM} km ke jaringan padat)")
+    print(f"   -> Outlier (Terputus / jauh & dikit tiangnya) : {n_outlier} tiang")
     if n_diblokir > 0:
         print(f"   -> 🚫 Dikecualikan (Blacklist Stort)   : {n_diblokir} tiang")
     print()
@@ -306,10 +357,12 @@ fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 7 * n_rows), squee
 warna = {
     'Main Network (Root)': '#3498db',
     'Sub-Cluster Valid': '#2ecc71',
+    'Sub-Cluster Valid (Dekat Jaringan Padat)': '#f39c12',
     'Outlier (Terputus)': '#e74c3c',
     '🚫 Dikecualikan (Blacklist Stort)': '#95a5a6',
 }
-ukuran = {'Main Network (Root)': 15, 'Sub-Cluster Valid': 22, 'Outlier (Terputus)': 25,
+ukuran = {'Main Network (Root)': 15, 'Sub-Cluster Valid': 22,
+          'Sub-Cluster Valid (Dekat Jaringan Padat)': 22, 'Outlier (Terputus)': 25,
           '🚫 Dikecualikan (Blacklist Stort)': 18}
 
 for i, reg in enumerate(daftar_regional_proses):
@@ -360,6 +413,7 @@ if BUAT_PETA_INTERAKTIF:
         warna_hex = {
             'Main Network (Root)': '#3498db',
             'Sub-Cluster Valid': '#2ecc71',
+            'Sub-Cluster Valid (Dekat Jaringan Padat)': '#f39c12',
             'Outlier (Terputus)': '#e74c3c',
             '🚫 Dikecualikan (Blacklist Stort)': '#7f8c8d',
         }
