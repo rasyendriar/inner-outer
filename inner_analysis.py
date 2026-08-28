@@ -3,56 +3,73 @@ import numpy as np
 import matplotlib.pyplot as plt
 from shapely.wkt import loads
 from scipy.spatial import KDTree
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
+from pyproj import Transformer
+from sklearn.neighbors import NearestNeighbors
+import hdbscan
 import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
 # PARAMETER IDE LU (SILAKAN DIMAINKAN)
 # ==========================================
+# GANTI PENDEKATAN: dulu pakai connected-components radius KAKU + koreksi manual (isolasi/rescue).
+# Sekarang pakai HDBSCAN -- keluarga algoritma DENSITY-BASED yang PUNYA KONSEP NOISE secara native.
+# "Outer" yang dimaksud memang BUKAN cluster -- itu titik yang gagal masuk cluster manapun (label -1).
+# K-Means gak dipake krn perlu k di depan & tiap titik PASTI kebagian cluster (gak ada noise). DBSCAN
+# polos juga kurang krn eps-nya GLOBAL -- padahal kepadatan tiang beda 2-3 orde besaran antar wilayah
+# (Jakarta vs pelosok). HDBSCAN jalanin DBSCAN di SEMUA nilai eps sekaligus & ambil cluster paling
+# stabil, jadi cluster padat di kota & cluster renggang di pinggiran bisa hidup berdampingan.
+#
+# Butuh: !pip install hdbscan scikit-learn pyproj -q  (jalanin di cell terpisah sebelum run script ini)
 INPUT_FILE = "data_tiang.csv"     # nama file csv tiang yang sudah di-upload
-RADIUS_SCAN_KM = 1.0              # Jarak maksimal loncatan antar tiang/cluster (1.0 = 1 kilometer)
-MIN_TIANG_SUBCLUSTER = 5          # minimal jumlah tiang supaya sekumpulan tiang dianggap
-                                   # "sub-cluster valid" (network kecil yg tetap solid), bukan outlier acak
 
-# BARU: koreksi tahap-2 pakai TEKNIK PENCARIAN JARAK (KDTree) ala Code 2 (inner_outer_choose.py).
-# Ada 2 masalah yang diperbaiki di sini (ketauan pas ngecek manual hasil plot R045-JABOJABAR):
+MIN_CLUSTER_SIZE = 10             # brp tiang minimal supaya layak disebut "titik keramaian" -- ini
+                                   # KEPUTUSAN BISNIS, bukan statistik murni. Naikkan buat lebih strict.
+MIN_SAMPLES = 3                   # makin gede -> makin galak nandain noise. Sebaran tiang itu MEMANJANG
+                                   # ngikutin jalan (bukan blobby kayak data pada umumnya), makanya
+                                   # dipakai KECIL (2-4) -- min_samples gede (10+) bikin ujung-ujung baris
+                                   # tiang yg padat sekalipun kecap noise semua krn tetangga di arah
+                                   # TEGAK LURUS jalan emang dikit.
+CLUSTER_SELECTION_EPSILON_M = 250.0  # gabungin cluster yg jaraknya < ini (dalam METER) -- cegah 1
+                                   # kelurahan kepecah jadi belasan cluster kecil gara-gara dikit putus
+                                   # di persimpangan/gang.
+CLUSTER_SELECTION_METHOD = 'eom'  # 'eom' -> cluster gede & stabil (dipakai di sini, analisa regional
+                                   # skala besar). 'leaf' -> lebih granular/detail per area kecil.
+
+# Definisi "outer" disusun BERLAPIS (biar gampang dijelasin ke stakeholder), bukan 1 kriteria doang:
 #
-#  MASALAH A - tiang "nempel" ke area padat malah kecap Outlier:
-#  connected-components dgn radius KAKU (RADIUS_SCAN_KM) bisa motong sekumpulan tiang jadi komponen
-#  kecil (< MIN_TIANG_SUBCLUSTER) walau posisinya masih MENEMPEL/dekat ke area padat (Main Network /
-#  Sub-Cluster Valid). Fix: tiang yang divonis Outlier dicek ULANG jaraknya (KDTree) ke tiang padat
-#  TERDEKAT. Kalau jaraknya <= JARAK_DEKAT_PADAT_KM -> direklasifikasi jadi Inner.
-#
-#  MASALAH B - komponen yg KEBETULAN >= MIN_TIANG_SUBCLUSTER tapi BENERAN KEPENCIL SENDIRIAN:
-#  sebaliknya, MIN_TIANG_SUBCLUSTER doang gak cukup -- komponen yg padat SECARA LOKAL (misal 59 tiang
-#  numpuk rapet) tapi lokasinya keliatan dari SEMUA jaringan lain (puluhan km, gak nempel kemana-mana)
-#  sebelumnya lolos otomatis jadi "Sub-Cluster Valid" padahal ini persis "outlier" yg dimaksud: terisolasi
-#  DAN jauh dari pusat tiang-tiang padat manapun. Fix: komponen yg jaraknya ke SEMUA komponen lain lebih
-#  jauh dari JARAK_TERISOLASI_KM diturunin ke Outlier, KECUALI ukurannya sendiri udah >= BATAS_MANDIRI_TERISOLASI
-#  (segede itu, dianggap emang jaringan/kota lain yg sah, walau posisinya jauh sendirian).
-#
-# Set JARAK_DEKAT_PADAT_KM None/<=RADIUS_SCAN_KM buat matiin Masalah A, atau JARAK_TERISOLASI_KM None
-# buat matiin Masalah B (balik ke perilaku lama, murni radius kaku + MIN_TIANG_SUBCLUSTER).
-JARAK_DEKAT_PADAT_KM = 5.0        # biasanya diisi LEBIH BESAR dari RADIUS_SCAN_KM (nyari lebih jauh
-                                   # drpd radius connectivity, itu intinya) -- mainkan sesuai kepadatan datamu
-JARAK_TERISOLASI_KM = 10.0        # di atas jarak ini ke komponen LAIN manapun -> dianggap "beneran kepencil"
-BATAS_MANDIRI_TERISOLASI = 150    # kecuali ukuran komponennya sendiri >= ini -> tetep Sub-Cluster Valid
+#  Layer 1 KERAS   -> label HDBSCAN == -1. Titik yg beneran gak nyambung ke kepadatan manapun.
+#  Layer 2 LUNAK   -> skor GLOSH (outlier_scores_) di atas persentil ini, DI ANTARA titik yg sudah
+#                     masuk cluster (bukan noise). Nangkep titik yg secara teknis masuk cluster tapi
+#                     ada di pinggirannya. Set None buat matiin layer ini.
+#  Layer 3 ATURAN BISNIS -> jarak cluster ke cluster VALID lain manapun melebihi JARAK_ATURAN_BISNIS_KM,
+#                     KECUALI ukuran cluster itu sendiri udah >= BATAS_MANDIRI_TERISOLASI (dianggap
+#                     emang kota/jaringan lain yg sah, walau lokasinya jauh sendirian). Ini nangkep
+#                     kasus yang HDBSCAN gak bisa nangkep sendiri: cluster yang PADAT SECARA LOKAL
+#                     (makanya gak kena noise) tapi kepencil jauh dari jaringan padat manapun -- paling
+#                     gampang dipertanggungjawabkan ke tim lapangan krn satuannya konkret (km).
+PERSENTIL_OUTLIER_LUNAK = 90
+JARAK_ATURAN_BISNIS_KM = 10.0
+BATAS_MANDIRI_TERISOLASI = 150
+
+K_TETANGGA_CORE_DISTANCE = 10     # k tetangga buat "core distance" -- estimator kepadatan lokal murah
+                                   # per titik (dari sklearn NearestNeighbors, bukan hdbscan internal),
+                                   # dipakai buat RANKING "inner dari yang paling padat". Makin kecil
+                                   # core distance-nya, makin padat lingkungan titik itu.
 
 # analisa dipecah per kolom 'regional', bukan digabung jadi 1 peta besar.
-# Root/jangkar, radius propagasi, dan kategorisasi dihitung SENDIRI-SENDIRI tiap regional,
+# Root/jangkar, proyeksi UTM, dan kategorisasi dihitung SENDIRI-SENDIRI tiap regional,
 # supaya tiang di Jateng gak nyambung/ketimpuk sama tiang di Jatim misalnya.
 # MODE_REGIONAL = 'SATU'  -> cuma proses 1 regional yang kamu pilih di REGIONAL_TERPILIH
 # MODE_REGIONAL = 'SEMUA' -> loop SEMUA regional sekaligus
 MODE_REGIONAL = 'SEMUA'
 REGIONAL_TERPILIH = 'R045-JABOJABAR'    # dipakai kalau MODE_REGIONAL = 'SATU'
 
-# BARU: kontrol titik awal (seed/jangkar "Main Network"), berdasarkan kolom 'stort'.
-# MODE_SEED = 'OTOMATIS'    -> BARU: prioritaskan STORT dengan jumlah TIANG PALING BANYAK dulu,
-#                               baru di dalam STORT itu dicari titik yang paling padat sbg jangkarnya.
-#                               (Kalau kolom 'stort' gak ada di data, fallback ke titik terpadat
-#                               dekat pusat geografis regional, kaya versi sebelumnya.)
+# kontrol titik awal (seed/jangkar "Main Network"), berdasarkan kolom 'stort'.
+# MODE_SEED = 'OTOMATIS'    -> prioritaskan STORT dengan jumlah TIANG PALING BANYAK dulu, baru di
+#                               dalam STORT itu dicari titik yang paling padat (core distance terkecil)
+#                               sbg jangkarnya. (Kalau kolom 'stort' gak ada, fallback ke titik dengan
+#                               core distance terkecil se-regional -- titik terpadat murni dari koordinat.)
 # MODE_SEED = 'PILIH_STORT' -> paksa jangkar mulai dari dalam salah satu STORT tertentu (misal 'BYL1'),
 #                               lalu di dalam stort itu dicari titik paling padat sbg jangkarnya.
 #                               Cluster yang MENGANDUNG titik itu yang jadi "Main Network (Root)".
@@ -63,12 +80,12 @@ SEED_STORT_PER_REGIONAL = {         # dipakai kalau MODE_REGIONAL='SEMUA' & MODE
     # 'R07 JAWA TIMUR': 'STORT_X',  # buat regional itu aja.
 }
 
-# BARU: RESTRICTION / BLACKLIST STORT.
-# Stort yang didaftar di sini DIKELUARKAN TOTAL dari graf konektivitas (dianggap gak ada) sebelum
-# connected-components dihitung -> tiang-tiangnya gak akan pernah jadi Main Network / Sub-Cluster Valid,
-# dan gak bisa jadi "jembatan" yang nyambungin 2 cluster lain. Tetap muncul di plot/CSV/peta, tapi
-# statusnya selalu "🚫 Dikecualikan (Blacklist Stort)". Cocok buat exclude STORT yang emang di luar
-# scope analisa/proyek ini. Pencocokan nama stort case-insensitive & spasi di ujung diabaikan.
+# RESTRICTION / BLACKLIST STORT.
+# Stort yang didaftar di sini DIKELUARKAN TOTAL dari clustering (dianggap gak ada) sebelum HDBSCAN
+# dijalankan -> tiang-tiangnya gak akan pernah jadi Main Network / Sub-Cluster Valid, dan gak bisa
+# jadi "jembatan" yang nyambungin 2 cluster lain. Tetap muncul di plot/CSV/peta, tapi statusnya selalu
+# "🚫 Dikecualikan (Blacklist Stort)". Cocok buat exclude STORT yang emang di luar scope analisa/proyek
+# ini. Pencocokan nama stort case-insensitive & spasi di ujung diabaikan.
 STORT_DIKECUALIKAN_TERPILIH = []     # dipakai kalau MODE_REGIONAL='SATU', isi list, misal: ['BYL2', 'BYL3']
 STORT_DIKECUALIKAN_PER_REGIONAL = {  # dipakai kalau MODE_REGIONAL='SEMUA'
     # 'R06 JAWA TENGAH': ['STORT_X', 'STORT_Y'],
@@ -139,20 +156,41 @@ for reg in daftar_regional_proses:
 print()
 
 
-def cari_seed_point(df_aktif, coords, kdtree, stort_pilihan, reg_name):
+def epsg_utm_dari_koordinat(lon_arr, lat_arr):
+    """Auto-deteksi EPSG UTM (WGS84) dari median lon/lat tiap regional -- 1 zona per regional,
+    cukup akurat buat analisa jarak level regional (eps/core-distance langsung kebaca dalam METER),
+    meski titik yang pas di pinggir zona (beda 6 derajat bujur) bakal sedikit meleset. Indonesia:
+    zona 46-54, belahan bumi selatan -> kode EPSG 327xx (kalau lat >= 0, dianggap 326xx / utara)."""
+    center_lon = np.median(lon_arr)
+    center_lat = np.median(lat_arr)
+    zona = int((center_lon + 180) / 6) + 1
+    return (32700 if center_lat < 0 else 32600) + zona
+
+
+def cari_mask_koordinat_invalid(df_r):
+    """Buang koordinat yang jelas rusak SEBELUM clustering -- kalau kebawa, bisa bikin 'cluster'
+    palsu yang sangat padat (density artifact), misalnya banyak tiang ke-snap ke titik (0,0)."""
+    lon, lat = df_r['lon'].to_numpy(), df_r['lat'].to_numpy()
+    return (
+        ((lon == 0) & (lat == 0))
+        | (lon < 90) | (lon > 145)   # di luar bounding box Indonesia
+        | (lat < -12) | (lat > 8)
+    )
+
+
+def cari_seed_point(df_aktif, coords_m, kdtree_m, stort_pilihan, reg_name, radius_densitas_m=500.0):
     """Tentukan index titik jangkar.
     - Kalau stort_pilihan diisi manual (MODE_SEED='PILIH_STORT'): paksa cari di dalam STORT itu.
-    - Kalau OTOMATIS (stort_pilihan kosong): BARU -> prioritaskan STORT dengan jumlah TIANG PALING
-      BANYAK dulu (bukan cuma titik terdekat ke pusat geografis), baru di dalam STORT terbanyak itu
-      dicari titik yang paling padat tetangganya sbg jangkar. Konsisten sama logika Code 2 (yang
-      otomatis mulai dari span paling padat).
-    - Kalau kolom 'stort' gak ada sama sekali di data -> return None, caller bakal fallback ke cara
-      lama (titik terpadat dekat pusat geografis regional, murni dari koordinat).
+    - Kalau OTOMATIS (stort_pilihan kosong): prioritaskan STORT dengan jumlah TIANG PALING BANYAK
+      dulu, baru di dalam STORT terbanyak itu dicari titik yang paling padat tetangganya sbg jangkar.
+    - Kalau kolom 'stort' gak ada sama sekali di data -> return None, caller bakal fallback ke titik
+      dengan core distance terkecil se-regional (titik terpadat murni dari koordinat).
+    coords_m/kdtree_m dalam METER (hasil proyeksi UTM), bukan derajat lat/lon lagi.
     """
     if 'stort' not in df_aktif.columns:
         if stort_pilihan:
             print(f"      ⚠️  Kolom 'stort' gak ada di data, SEED_STORT diabaikan -> pakai mode otomatis lama.")
-        return None, 'OTOMATIS (kolom stort tidak ada, pakai titik terpadat dekat pusat)'
+        return None, 'OTOMATIS (kolom stort tidak ada, pakai titik ber-core-distance terkecil)'
 
     if stort_pilihan:
         stort_tersedia = sorted(df_aktif['stort'].dropna().unique())
@@ -160,7 +198,7 @@ def cari_seed_point(df_aktif, coords, kdtree, stort_pilihan, reg_name):
         if not cocok:
             print(f"      ⚠️  SEED_STORT='{stort_pilihan}' gak ketemu di regional '{reg_name}'. "
                   f"Stort yang tersedia di sini: {stort_tersedia}. Fallback ke STORT terbanyak (otomatis).")
-            stort_asli = None  # jatuh ke logika 'terbanyak' di bawah
+            stort_asli = None
             keterangan_awal = None
         else:
             stort_asli = cocok[0]
@@ -170,28 +208,27 @@ def cari_seed_point(df_aktif, coords, kdtree, stort_pilihan, reg_name):
         keterangan_awal = None
 
     if stort_asli is None:
-        # BARU: OTOMATIS = prioritaskan STORT dengan jumlah tiang PALING BANYAK
         hitung_stort = df_aktif['stort'].value_counts()
         if len(hitung_stort) == 0:
-            return None, 'OTOMATIS (kolom stort kosong semua, pakai titik terpadat dekat pusat)'
+            return None, 'OTOMATIS (kolom stort kosong semua, pakai titik ber-core-distance terkecil)'
         stort_asli = hitung_stort.idxmax()
         keterangan_awal = f"OTOMATIS: STORT terbanyak='{stort_asli}' ({int(hitung_stort.max())} tiang)"
 
     idx_kandidat = df_aktif.index[df_aktif['stort'] == stort_asli].to_numpy()
     if len(idx_kandidat) == 0:
-        return None, 'OTOMATIS (stort kosong, pakai titik terpadat dekat pusat)'
+        return None, 'OTOMATIS (stort kosong, pakai titik ber-core-distance terkecil)'
 
     MAKS_KANDIDAT = 5000  # batas biar tetap cepat walau 1 stort isinya puluhan ribu tiang
     if len(idx_kandidat) > MAKS_KANDIDAT:
         idx_kandidat = np.random.RandomState(42).choice(idx_kandidat, MAKS_KANDIDAT, replace=False)
 
-    neighbor_counts = np.array([len(kdtree.query_ball_point(coords[i], r=0.5 / 111.0)) for i in idx_kandidat])
+    neighbor_counts = np.array([len(kdtree_m.query_ball_point(coords_m[i], r=radius_densitas_m)) for i in idx_kandidat])
     best_local = int(idx_kandidat[np.argmax(neighbor_counts)])
     return best_local, f"{keterangan_awal} -> titik terpadat di situ"
 
 
 def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
-    """Cari mask baris yang di-blacklist -> dikeluarkan TOTAL dari graf konektivitas."""
+    """Cari mask baris yang di-blacklist -> dikeluarkan TOTAL dari clustering."""
     n = len(df_r)
     mask = np.zeros(n, dtype=bool)
     if not stort_dikecualikan:
@@ -210,196 +247,207 @@ def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
         return mask
 
     mask = df_r['stort'].isin(stort_cocok).to_numpy()
-    print(f"      🚫 STORT dikecualikan: {stort_cocok} -> {int(mask.sum())} tiang diblokir total dari analisa konektivitas.")
+    print(f"      🚫 STORT dikecualikan: {stort_cocok} -> {int(mask.sum())} tiang diblokir total dari clustering.")
     return mask
 
 
-def analisa_satu_regional(df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_pilihan, reg_name, stort_dikecualikan,
-                           JARAK_DEKAT_PADAT_KM=None, JARAK_TERISOLASI_KM=None, BATAS_MANDIRI_TERISOLASI=150):
-    """Jalankan seluruh logika propagasi & kategorisasi untuk 1 subset regional saja.
+def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
+                           MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
+                           PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI,
+                           K_TETANGGA_CORE_DISTANCE):
+    """Jalankan HDBSCAN + kategorisasi 3-lapis untuk 1 subset regional saja.
 
-    CATATAN PERFORMA: connected-components dibangun dari pasangan tetangga SATU ARAH saja
-    (row=pairs[:,0], col=pairs[:,1]) -- scipy sudah otomatis anggap graf undirected kalau
-    directed=False, jadi gak perlu disimetriskan manual (dobelin array). Ini terbukti ~6x lebih
-    cepat di data padat (10 detik -> 1.7 detik utk 67rb titik dgn 19 juta pasangan tetangga).
-    Kategorisasi juga divektorisasi pakai np.where, bukan df.apply(axis=1) yang lambat di data besar.
+    CATATAN PROYEKSI: jarak dihitung di ruang UTM (meter), BUKAN langsung di derajat lat/lon --
+    supaya eps/core-distance/jarak aturan-bisnis semua kebaca dalam satuan yang konsisten & gak
+    distorsi antar wilayah (lihat epsg_utm_dari_koordinat).
 
-    CATATAN BLACKLIST: tiang dari STORT yang dikecualikan dikeluarkan SEBELUM KDTree/graf dibangun,
-    jadi mereka gak bisa jadi "jembatan" yang nyambungin 2 cluster yang harusnya terpisah.
+    CATATAN BLACKLIST & KOORDINAT INVALID: tiang dari STORT yang dikecualikan, dan tiang yang
+    koordinatnya jelas rusak ((0,0) / di luar bounding box Indonesia), dikeluarkan SEBELUM HDBSCAN
+    dijalankan, jadi gak ikut membentuk cluster / gak bisa jadi density-artifact.
 
-    CATATAN KOREKSI (ala Code 2 / inner_outer_choose.py) -- 2 tahap, lihat juga catatan parameter
-    JARAK_DEKAT_PADAT_KM / JARAK_TERISOLASI_KM / BATAS_MANDIRI_TERISOLASI di bagian atas file:
-
-    Tahap 3a (turunin komponen yg KEPENCIL SENDIRIAN): komponen yg >= MIN_TIANG_SUBCLUSTER (jadi
-    lolos jadi 'Sub-Cluster Valid' di step 3) tapi jaraknya ke SEMUA komponen lain lebih jauh dari
-    JARAK_TERISOLASI_KM diturunin jadi 'Outlier (Terputus)' -- KECUALI ukurannya sendiri udah
-    >= BATAS_MANDIRI_TERISOLASI. Ini dicek pakai graf connected-components KEDUA yg radiusnya jauh
-    lebih gede (JARAK_TERISOLASI_KM) drpd RADIUS_SCAN_KM: kalau komponen si tiang di graf-gede ini
-    ukurannya SAMA PERSIS kayak komponen di graf-kecil (RADIUS_SCAN_KM), artinya emang gak ada
-    komponen lain manapun yg nyambung/deket bahkan di radius segede itu -> beneran kepencil sendirian.
-
-    Tahap 3b (selamatin komponen yg NEMPEL ke area padat): kebalikannya -- komponen kecil (< MIN_TIANG_
-    SUBCLUSTER, atau abis diturunin di 3a) yg ternyata masih deket (<= JARAK_DEKAT_PADAT_KM, dicek pakai
-    KDTree.query, teknik pencarian jarak-terdekat yg sama kayak dipakai nyari span di Code 2) ke tiang
-    padat (Main Network / Sub-Cluster Valid) TERDEKAT, diselamatkan balik jadi Inner.
-
-    Intinya niru definisi "outlier beneran" = terisolasi DAN jauh dari pusat tiang padat manapun
-    (3a) DAN dikit tiangnya (gagal MIN_TIANG_SUBCLUSTER atau BATAS_MANDIRI_TERISOLASI) -- tapi begitu
-    dia masih nempel ke area padat (3b), tetap dianggap Inner.
+    CATATAN 3 LAPIS "OUTER" (lihat juga catatan parameter di bagian atas file):
+    Layer 1 KERAS   = label HDBSCAN == -1 (noise asli, gak nyambung ke kepadatan manapun).
+    Layer 2 LUNAK   = skor GLOSH (outlier_scores_) di atas persentil PERSENTIL_OUTLIER_LUNAK, di
+                      antara titik yang SUDAH masuk cluster -- masih dihitung Inner tapi ditandai
+                      "Soft Outlier / Pinggiran" biar gampang diaudit.
+    Layer 3 ATURAN BISNIS = cluster (bukan noise, bukan root) yang jaraknya ke cluster VALID lain
+                      manapun > JARAK_ATURAN_BISNIS_KM, KECUALI ukurannya sendiri udah >=
+                      BATAS_MANDIRI_TERISOLASI. Ini WAJIB ada di luar HDBSCAN sendiri, karena HDBSCAN
+                      cuma peduli KEPADATAN LOKAL -- cluster yang padat secara lokal tapi kepencil
+                      jauh dari jaringan padat manapun TETAP dianggap cluster valid oleh HDBSCAN.
     """
     df_r = df_r.reset_index(drop=True)
 
+    mask_invalid = cari_mask_koordinat_invalid(df_r)
+    if mask_invalid.any():
+        print(f"      ⚠️  {int(mask_invalid.sum())} tiang koordinatnya aneh ((0,0)/di luar Indonesia) -> dikeluarkan dari clustering.")
     diblokir_mask = cari_mask_diblokir(df_r, stort_dikecualikan, reg_name)
-    df_diblokir = df_r[diblokir_mask].copy()
-    df_aktif = df_r[~diblokir_mask].reset_index(drop=True)
+
+    kategori_keluar = np.full(len(df_r), '', dtype=object)
+    kategori_keluar[diblokir_mask] = '🚫 Dikecualikan (Blacklist Stort)'
+    kategori_keluar[mask_invalid] = '❌ Koordinat Tidak Valid'  # prioritas kalau tumpang tindih sama blacklist
+
+    mask_keluar = mask_invalid | diblokir_mask
+    df_keluar = df_r[mask_keluar].copy()
+    df_keluar['Kategori_Propagasi'] = kategori_keluar[mask_keluar]
+    df_aktif = df_r[~mask_keluar].reset_index(drop=True)
     n = len(df_aktif)
 
     if n == 0:
-        print(f"      ⚠️  Semua tiang di regional ini kena blacklist, gak ada yang diproses.")
-        if len(df_diblokir) > 0:
-            df_diblokir['cluster_id'] = 'DIBLOKIR'
-            df_diblokir['Jumlah_Tiang_Cluster'] = 0
-            df_diblokir['Kategori_Propagasi'] = '🚫 Dikecualikan (Blacklist Stort)'
-        return df_diblokir, None
+        print(f"      ⚠️  Semua tiang di regional ini kena blacklist/koordinat invalid, gak ada yang diproses.")
+        df_keluar['cluster_id'] = -1
+        df_keluar['Jumlah_Tiang_Cluster'] = 0
+        return df_keluar, None, float('nan')
 
-    coords = df_aktif[['lon', 'lat']].values
-    kdtree = KDTree(coords)
-    RADIUS_DEG = RADIUS_SCAN_KM / 111.0
+    # --- proyeksi ke UTM (meter) ---
+    coords_deg = df_aktif[['lon', 'lat']].values
+    epsg_dipakai = epsg_utm_dari_koordinat(coords_deg[:, 0], coords_deg[:, 1])
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_dipakai}", always_xy=True)
+    x_m, y_m = transformer.transform(coords_deg[:, 0], coords_deg[:, 1])
+    coords_m = np.column_stack([x_m, y_m])
 
-    # 1. Semua connected component dalam regional ini (dioptimasi, lihat catatan performa di atas)
-    pairs = kdtree.query_pairs(r=RADIUS_DEG, output_type='ndarray')
-    if len(pairs) > 0:
-        graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
-    else:
-        graph = coo_matrix((n, n))
-    n_components, labels = connected_components(csgraph=graph, directed=False)
+    # 1. HDBSCAN -- cluster + noise (-1) native
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=MIN_CLUSTER_SIZE,
+        min_samples=MIN_SAMPLES,
+        cluster_selection_epsilon=float(CLUSTER_SELECTION_EPSILON_M),
+        cluster_selection_method=CLUSTER_SELECTION_METHOD,
+        metric='euclidean',
+        core_dist_n_jobs=-1,
+        gen_min_span_tree=True,
+    ).fit(coords_m)
+    labels = clusterer.labels_
+    glosh_scores = clusterer.outlier_scores_
+    try:
+        dbcv = float(clusterer.relative_validity_)   # DBCV -- bukan silhouette (asumsi cembung, salah
+                                                       # utk cluster tiang yg memanjang ngikutin jalan)
+    except Exception:
+        dbcv = float('nan')
+
     df_aktif['cluster_id'] = labels
-    cluster_sizes = df_aktif['cluster_id'].value_counts()
-    df_aktif['Jumlah_Tiang_Cluster'] = df_aktif['cluster_id'].map(cluster_sizes).to_numpy()
+    cluster_sizes_s = pd.Series(labels).value_counts()
+    df_aktif['Jumlah_Tiang_Cluster'] = pd.Series(labels).map(cluster_sizes_s).to_numpy()
+    df_aktif.loc[labels == -1, 'Jumlah_Tiang_Cluster'] = 0  # noise bukan "cluster", size-nya gak relevan
 
-    # 2. Root/jangkar: OTOMATIS atau dipaksa dari SEED_STORT
-    best_start_idx, keterangan_seed = cari_seed_point(df_aktif, coords, kdtree, stort_pilihan, reg_name)
+    # 2. core distance -- estimator kepadatan lokal MURAH per titik, dipakai buat ranking "inner dari
+    #    yang paling padat" (bukan hitung ulang lewat HDBSCAN internal)
+    k_eff = min(K_TETANGGA_CORE_DISTANCE + 1, n)
+    nn = NearestNeighbors(n_neighbors=k_eff).fit(coords_m)
+    dist_nn, _ = nn.kneighbors(coords_m)
+    core_dist_m = dist_nn[:, -1]
+    df_aktif['Core_Distance_m'] = core_dist_m
+    df_aktif['Rank_Kepadatan'] = pd.Series(core_dist_m).rank(method='min').astype(int)  # 1 = paling padat
+    df_aktif['Skor_Outlier_GLOSH'] = glosh_scores
+
+    # 3. Root/jangkar: OTOMATIS (STORT terbanyak) atau dipaksa dari SEED_STORT
+    kdtree_m = KDTree(coords_m)
+    best_start_idx, keterangan_seed = cari_seed_point(df_aktif, coords_m, kdtree_m, stort_pilihan, reg_name)
     if best_start_idx is None:
-        center_lon, center_lat = df_aktif['lon'].mean(), df_aktif['lat'].mean()
-        dists_to_center = np.sum((coords - [center_lon, center_lat]) ** 2, axis=1)
-        closest_100_idx = np.argsort(dists_to_center)[:min(100, n)]
-        best_start_idx, max_neighbors = -1, -1
-        for idx in closest_100_idx:
-            n_count = len(kdtree.query_ball_point(coords[idx], r=0.5 / 111.0))
-            if n_count > max_neighbors:
-                max_neighbors, best_start_idx = n_count, idx
-    root_cluster_id = df_aktif.loc[best_start_idx, 'cluster_id']
-    print(f"   🌱 Titik jangkar [{keterangan_seed}] -> cluster_id lokal {root_cluster_id}")
+        best_start_idx = int(np.argmin(core_dist_m))  # titik ber-core-distance terkecil se-regional
+    root_label = labels[best_start_idx]
+    if root_label == -1:
+        mask_valid0 = labels != -1
+        if mask_valid0.any():
+            kdt_valid0 = KDTree(coords_m[mask_valid0])
+            _, idx_rel = kdt_valid0.query(coords_m[best_start_idx], k=1)
+            root_label = labels[np.where(mask_valid0)[0][idx_rel]]
+            print(f"      ⚠️  Titik jangkar kebetulan jatuh di titik noise (HDBSCAN) -> digeser ke cluster valid terdekat.")
+    print(f"   🌱 Titik jangkar [{keterangan_seed}] -> cluster label {root_label} | "
+          f"DBCV={dbcv:.3f} | {int(labels.max()) + 1} cluster, {int((labels == -1).sum())} noise "
+          f"({(labels == -1).mean() * 100:.1f}%)")
 
-    # 3. Kategorisasi -- divektorisasi (np.where), BUKAN df.apply(axis=1) yang lambat di data besar
-    cluster_id_arr = df_aktif['cluster_id'].to_numpy()
-    jml_cluster_arr = df_aktif['Jumlah_Tiang_Cluster'].to_numpy()
-    df_aktif['Kategori_Propagasi'] = np.where(
-        cluster_id_arr == root_cluster_id, 'Main Network (Root)',
-        np.where(jml_cluster_arr >= MIN_TIANG_SUBCLUSTER, 'Sub-Cluster Valid', 'Outlier (Terputus)')
+    # 4. LAYER 1 (KERAS): noise asli
+    is_noise = labels == -1
+
+    # 5. LAYER 3 (ATURAN BISNIS): cluster (bukan noise/root) yang kepencil jauh dari SEMUA cluster
+    #    valid lain, kecuali ukurannya sendiri udah gede banget (lihat docstring)
+    is_bisnis_outlier = np.zeros(n, dtype=bool)
+    if JARAK_ATURAN_BISNIS_KM is not None:
+        JARAK_M = JARAK_ATURAN_BISNIS_KM * 1000.0
+        for lab, sz in cluster_sizes_s.items():
+            if lab == -1 or lab == root_label or sz >= BATAS_MANDIRI_TERISOLASI:
+                continue
+            idxs = np.where(labels == lab)[0]
+            mask_luar = (labels != lab) & (labels != -1)
+            if not mask_luar.any():
+                continue
+            kdt_luar = KDTree(coords_m[mask_luar])
+            d, _ = kdt_luar.query(coords_m[idxs], k=1)
+            if d.min() > JARAK_M:
+                is_bisnis_outlier[idxs] = True
+    n_bisnis = int(is_bisnis_outlier.sum())
+    if n_bisnis > 0:
+        print(f"      📉 Layer 3 (Aturan Bisnis): {n_bisnis} tiang di cluster yang padat SECARA LOKAL "
+              f"tapi kepencil > {JARAK_ATURAN_BISNIS_KM} km dari cluster valid manapun -> Outlier.")
+
+    # 6. LAYER 2 (LUNAK): skor GLOSH di atas persentil, cuma di antara titik yg masih calon Inner
+    is_soft_outlier = np.zeros(n, dtype=bool)
+    kandidat_lunak = (~is_noise) & (~is_bisnis_outlier) & (labels != root_label)
+    if PERSENTIL_OUTLIER_LUNAK is not None and kandidat_lunak.any():
+        ambang_lunak = np.percentile(glosh_scores[kandidat_lunak], PERSENTIL_OUTLIER_LUNAK)
+        is_soft_outlier = kandidat_lunak & (glosh_scores >= ambang_lunak)
+
+    # 7. Gabungin jadi Kategori_Propagasi final
+    kategori = np.where(
+        labels == root_label, 'Main Network (Root)',
+        np.where(is_noise, 'Outlier (Noise - HDBSCAN)',
+        np.where(is_bisnis_outlier, 'Outlier (Aturan Bisnis - Terisolasi)',
+        np.where(is_soft_outlier, 'Sub-Cluster Valid (Soft Outlier - Pinggiran)',
+        'Sub-Cluster Valid')))
     )
+    df_aktif['Kategori_Propagasi'] = kategori
 
-    # 3a. TURUNIN komponen yang KEPENCIL SENDIRIAN, lihat catatan di docstring.
-    # Cuma jalan kalau JARAK_TERISOLASI_KM diisi & lebih besar dari RADIUS_SCAN_KM.
-    if JARAK_TERISOLASI_KM is not None and JARAK_TERISOLASI_KM > RADIUS_SCAN_KM:
-        JARAK_TERISOLASI_DEG = JARAK_TERISOLASI_KM / 111.0
-        pairs_isolasi = kdtree.query_pairs(r=JARAK_TERISOLASI_DEG, output_type='ndarray')
-        if len(pairs_isolasi) > 0:
-            graph_isolasi = coo_matrix(
-                (np.ones(len(pairs_isolasi)), (pairs_isolasi[:, 0], pairs_isolasi[:, 1])), shape=(n, n)
-            )
-        else:
-            graph_isolasi = coo_matrix((n, n))
-        _, labels_isolasi = connected_components(csgraph=graph_isolasi, directed=False)
-        pulau_sizes = pd.Series(labels_isolasi).value_counts()
-        jml_pulau_arr = pd.Series(labels_isolasi).map(pulau_sizes).to_numpy()
+    root_point = coords_deg[best_start_idx].copy()  # simpan KOORDINAT lon/lat asli (bukan meter/index)
 
-        kategori_arr = df_aktif['Kategori_Propagasi'].to_numpy()
-        # "kepencil sendirian" = ukuran pulau (radius jauh) SAMA PERSIS kayak ukuran cluster (radius
-        # kecil) -> gak ada komponen lain manapun yang nyambung bahkan di radius sejauh itu.
-        mask_kepencil = (
-            (kategori_arr == 'Sub-Cluster Valid')
-            & (jml_pulau_arr == jml_cluster_arr)
-            & (jml_cluster_arr < BATAS_MANDIRI_TERISOLASI)
-        )
-        n_diturunkan = int(mask_kepencil.sum())
-        if n_diturunkan > 0:
-            kategori_arr = kategori_arr.copy()
-            kategori_arr[mask_kepencil] = 'Outlier (Terputus)'
-            df_aktif['Kategori_Propagasi'] = kategori_arr
-            print(f"      📉 Koreksi isolasi (ala Code 2): {n_diturunkan} tiang yang tadinya "
-                  f"'Sub-Cluster Valid' ternyata > {JARAK_TERISOLASI_KM} km dari komponen manapun & "
-                  f"< {BATAS_MANDIRI_TERISOLASI} tiang -> diturunkan jadi Outlier (kepencil sendirian).")
-
-    # 3b. SELAMATIN komponen yang NEMPEL ke area padat -- teknik pencarian jarak (KDTree) ala Code 2,
-    # lihat catatan di docstring.
-    # Hanya jalan kalau JARAK_DEKAT_PADAT_KM diisi & lebih besar dari RADIUS_SCAN_KM (kalau lebih
-    # kecil/sama, gak akan pernah nemu apa-apa karena titik segitu deketnya udah pasti KESAMBUNG
-    # dari step 1 & gak akan pernah kecap Outlier duluan).
-    if JARAK_DEKAT_PADAT_KM is not None and JARAK_DEKAT_PADAT_KM > RADIUS_SCAN_KM:
-        kategori_arr = df_aktif['Kategori_Propagasi'].to_numpy()
-        mask_padat = np.isin(kategori_arr, ['Main Network (Root)', 'Sub-Cluster Valid'])
-        mask_outlier_awal = kategori_arr == 'Outlier (Terputus)'
-
-        if mask_padat.any() and mask_outlier_awal.any():
-            kdtree_padat = KDTree(coords[mask_padat])
-            JARAK_DEKAT_DEG = JARAK_DEKAT_PADAT_KM / 111.0
-            idx_outlier = np.where(mask_outlier_awal)[0]
-            dist_ke_padat, _ = kdtree_padat.query(coords[idx_outlier], k=1)
-            dekat_ke_padat = dist_ke_padat <= JARAK_DEKAT_DEG
-
-            n_diselamatkan = int(dekat_ke_padat.sum())
-            if n_diselamatkan > 0:
-                kategori_arr = kategori_arr.copy()
-                kategori_arr[idx_outlier[dekat_ke_padat]] = 'Sub-Cluster Valid (Dekat Jaringan Padat)'
-                df_aktif['Kategori_Propagasi'] = kategori_arr
-                print(f"      🔎 Koreksi jarak (ala Code 2): {n_diselamatkan} tiang yang tadinya "
-                      f"'Outlier (Terputus)' ternyata masih <= {JARAK_DEKAT_PADAT_KM} km dari jaringan "
-                      f"padat -> direklasifikasi jadi Inner ('Sub-Cluster Valid (Dekat Jaringan Padat)').")
-
-    root_point = coords[best_start_idx].copy()  # simpan KOORDINAT (bukan index, karena index berubah pas digabung)
-
-    if len(df_diblokir) > 0:
-        df_diblokir['cluster_id'] = 'DIBLOKIR'
-        df_diblokir['Jumlah_Tiang_Cluster'] = 0
-        df_diblokir['Kategori_Propagasi'] = '🚫 Dikecualikan (Blacklist Stort)'
-        df_gabung = pd.concat([df_aktif, df_diblokir], ignore_index=True)
+    if len(df_keluar) > 0:
+        df_keluar['cluster_id'] = -1
+        df_keluar['Jumlah_Tiang_Cluster'] = 0
+        df_gabung = pd.concat([df_aktif, df_keluar], ignore_index=True)
     else:
         df_gabung = df_aktif
 
-    return df_gabung, root_point
+    return df_gabung, root_point, dbcv
 
 
 hasil_per_regional = []
 info_root_point = {}
+info_dbcv = {}
 for reg in daftar_regional_proses:
     df_r = df[df['regional'] == reg].copy()
     print(f"📍 Regional: {reg}  (total {len(df_r)} tiang)")
-    df_r, root_point = analisa_satu_regional(
-        df_r, RADIUS_SCAN_KM, MIN_TIANG_SUBCLUSTER, stort_final[reg], reg, stort_dikecualikan_final[reg],
-        JARAK_DEKAT_PADAT_KM, JARAK_TERISOLASI_KM, BATAS_MANDIRI_TERISOLASI
+    df_r, root_point, dbcv = analisa_satu_regional(
+        df_r, stort_final[reg], reg, stort_dikecualikan_final[reg],
+        MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
+        PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI, K_TETANGGA_CORE_DISTANCE
     )
     # cluster_id dibikin unik lintas regional biar gak ketuker pas digabung nanti
     df_r['cluster_id'] = reg + "_" + df_r['cluster_id'].astype(str)
 
     n_main = (df_r['Kategori_Propagasi'] == 'Main Network (Root)').sum()
     n_sub = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid').sum()
-    n_dekat_padat = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid (Dekat Jaringan Padat)').sum()
-    n_outlier = (df_r['Kategori_Propagasi'] == 'Outlier (Terputus)').sum()
+    n_lunak = (df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid (Soft Outlier - Pinggiran)').sum()
+    n_bisnis = (df_r['Kategori_Propagasi'] == 'Outlier (Aturan Bisnis - Terisolasi)').sum()
+    n_noise = (df_r['Kategori_Propagasi'] == 'Outlier (Noise - HDBSCAN)').sum()
     n_diblokir = (df_r['Kategori_Propagasi'] == '🚫 Dikecualikan (Blacklist Stort)').sum()
-    n_sub_clusters = df_r.loc[df_r['Kategori_Propagasi'] == 'Sub-Cluster Valid', 'cluster_id'].nunique()
+    n_invalid = (df_r['Kategori_Propagasi'] == '❌ Koordinat Tidak Valid').sum()
+    n_sub_clusters = df_r.loc[df_r['Kategori_Propagasi'].isin(
+        ['Sub-Cluster Valid', 'Sub-Cluster Valid (Soft Outlier - Pinggiran)']), 'cluster_id'].nunique()
 
-    print(f"   -> Main Network (Root)                : {n_main} tiang")
-    print(f"   -> Sub-Cluster Valid (>= {MIN_TIANG_SUBCLUSTER} tiang) : {n_sub} tiang ({n_sub_clusters} cluster)")
-    if n_dekat_padat > 0:
-        print(f"   -> Sub-Cluster Valid (Dekat Jaringan Padat) : {n_dekat_padat} tiang "
-              f"(diselamatkan dari Outlier, masih <= {JARAK_DEKAT_PADAT_KM} km ke jaringan padat)")
-    print(f"   -> Outlier (Terputus / jauh & dikit tiangnya) : {n_outlier} tiang")
+    print(f"   -> Main Network (Root)                        : {n_main} tiang")
+    print(f"   -> Sub-Cluster Valid (>= {MIN_CLUSTER_SIZE} tiang)             : {n_sub} tiang ({n_sub_clusters} cluster)")
+    if n_lunak > 0:
+        print(f"   -> Sub-Cluster Valid (Soft Outlier / Pinggiran) : {n_lunak} tiang "
+              f"(GLOSH >= persentil {PERSENTIL_OUTLIER_LUNAK}, tetap Inner tapi ditandai)")
+    print(f"   -> Outlier (Aturan Bisnis - Terisolasi)       : {n_bisnis} tiang")
+    print(f"   -> Outlier (Noise - HDBSCAN)                  : {n_noise} tiang")
+    if n_invalid > 0:
+        print(f"   -> ❌ Koordinat Tidak Valid                    : {n_invalid} tiang")
     if n_diblokir > 0:
-        print(f"   -> 🚫 Dikecualikan (Blacklist Stort)   : {n_diblokir} tiang")
+        print(f"   -> 🚫 Dikecualikan (Blacklist Stort)           : {n_diblokir} tiang")
     print()
 
     info_root_point[reg] = root_point
+    info_dbcv[reg] = dbcv
     hasil_per_regional.append(df_r)
 
 df_all = pd.concat(hasil_per_regional, ignore_index=True)
@@ -414,13 +462,19 @@ fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 7 * n_rows), squee
 warna = {
     'Main Network (Root)': '#3498db',
     'Sub-Cluster Valid': '#2ecc71',
-    'Sub-Cluster Valid (Dekat Jaringan Padat)': '#f39c12',
-    'Outlier (Terputus)': '#e74c3c',
+    'Sub-Cluster Valid (Soft Outlier - Pinggiran)': '#f39c12',
+    'Outlier (Aturan Bisnis - Terisolasi)': '#9b59b6',
+    'Outlier (Noise - HDBSCAN)': '#e74c3c',
+    '❌ Koordinat Tidak Valid': '#2c3e50',
     '🚫 Dikecualikan (Blacklist Stort)': '#95a5a6',
 }
-ukuran = {'Main Network (Root)': 15, 'Sub-Cluster Valid': 22,
-          'Sub-Cluster Valid (Dekat Jaringan Padat)': 22, 'Outlier (Terputus)': 25,
-          '🚫 Dikecualikan (Blacklist Stort)': 18}
+ukuran = {
+    'Main Network (Root)': 15, 'Sub-Cluster Valid': 22,
+    'Sub-Cluster Valid (Soft Outlier - Pinggiran)': 22, 'Outlier (Aturan Bisnis - Terisolasi)': 28,
+    'Outlier (Noise - HDBSCAN)': 25, '❌ Koordinat Tidak Valid': 30, '🚫 Dikecualikan (Blacklist Stort)': 18,
+}
+KAT_ATAS = ('Outlier (Aturan Bisnis - Terisolasi)', 'Outlier (Noise - HDBSCAN)',
+            '❌ Koordinat Tidak Valid', '🚫 Dikecualikan (Blacklist Stort)')
 
 for i, reg in enumerate(daftar_regional_proses):
     ax = axes[i // n_cols][i % n_cols]
@@ -430,18 +484,20 @@ for i, reg in enumerate(daftar_regional_proses):
         if len(sub) == 0:
             continue
         ax.scatter(sub['lon'], sub['lat'], c=c, s=ukuran[kat], alpha=0.85,
-                   edgecolors='black' if kat not in ('Main Network (Root)',) else 'none',
+                   edgecolors='black' if kat != 'Main Network (Root)' else 'none',
                    linewidths=0.5, label=f'{kat} ({len(sub)})',
-                   zorder=2 if kat not in ('Outlier (Terputus)', '🚫 Dikecualikan (Blacklist Stort)') else 3)
+                   zorder=3 if kat in KAT_ATAS else 2)
     root_point = info_root_point.get(reg)
     if root_point is not None:
         ax.scatter(root_point[0], root_point[1], c='#f1c40f', marker='*', s=350,
                    edgecolors='black', label='Titik Jangkar (Root)', zorder=4)
-    ax.set_title(f'{reg}\nRadius: {RADIUS_SCAN_KM} km | Min. Sub-Cluster: {MIN_TIANG_SUBCLUSTER} tiang',
-                 fontsize=12, fontweight='bold')
+    dbcv = info_dbcv.get(reg, float('nan'))
+    ax.set_title(f'{reg}\nHDBSCAN min_cluster={MIN_CLUSTER_SIZE} min_samples={MIN_SAMPLES} '
+                 f'eps={CLUSTER_SELECTION_EPSILON_M:.0f}m | DBCV={dbcv:.3f}',
+                 fontsize=11, fontweight='bold')
     ax.set_xlabel('Longitude')
     ax.set_ylabel('Latitude')
-    ax.legend(loc='upper right', framealpha=0.9, fontsize=8)
+    ax.legend(loc='upper right', framealpha=0.9, fontsize=7)
     ax.grid(True, linestyle=':', alpha=0.7)
 
 # matikan panel kosong kalau jumlah regional ganjil
@@ -455,9 +511,11 @@ plt.show()
 # 5. EXPORT CSV (semua regional, 1 file, kolom 'regional' jadi penanda)
 # ==========================================
 df_export = df_all.drop(columns=['geometry', 'lon', 'lat'])
-export_filename = f"TiangJabo_Propagasi_{RADIUS_SCAN_KM}km_min{MIN_TIANG_SUBCLUSTER}_per_regional.csv"
+export_filename = f"TiangJabo_HDBSCAN_mcs{MIN_CLUSTER_SIZE}_ms{MIN_SAMPLES}_eps{int(CLUSTER_SELECTION_EPSILON_M)}m_per_regional.csv"
 df_export.to_csv(export_filename, index=False)
 print(f"✅ File CSV berhasil disimpan: {export_filename}")
+print("   (kolom 'Core_Distance_m' & 'Rank_Kepadatan' bisa dipakai buat urutin tiang dari yang paling")
+print("    padat -- makin kecil Core_Distance_m / makin kecil Rank_Kepadatan, makin padat lingkungannya)")
 
 # ==========================================
 # 6. PETA INTERAKTIF (folium) - basemap OpenStreetMap asli per regional
@@ -467,13 +525,7 @@ if BUAT_PETA_INTERAKTIF:
         import folium
 
         MAKS_TITIK_PER_KATEGORI = 4000  # batas titik yg digambar 1-1 per kategori biar peta tetap ringan
-        warna_hex = {
-            'Main Network (Root)': '#3498db',
-            'Sub-Cluster Valid': '#2ecc71',
-            'Sub-Cluster Valid (Dekat Jaringan Padat)': '#f39c12',
-            'Outlier (Terputus)': '#e74c3c',
-            '🚫 Dikecualikan (Blacklist Stort)': '#7f8c8d',
-        }
+        warna_hex = dict(warna)
 
         for reg in daftar_regional_proses:
             df_r = df_all[df_all['regional'] == reg]
@@ -508,9 +560,17 @@ if BUAT_PETA_INTERAKTIF:
                 ).add_to(m)
 
             folium.LayerControl(collapsed=False).add_to(m)
-            nama_file_peta = f"Peta_Propagasi_{reg.replace(' ', '_')}.html"
+            nama_file_peta = f"Peta_HDBSCAN_{reg.replace(' ', '_')}.html"
             m.save(nama_file_peta)
             print(f"🗺️  Peta interaktif disimpan: {nama_file_peta} (buka di browser buat ngecek visual)")
     except ImportError:
         print("\n⚠️  Package 'folium' belum ke-install, peta interaktif dilewati.")
         print("    Jalankan `!pip install folium -q` di cell terpisah lalu run ulang script ini kalau mau peta-nya.")
+
+# ==========================================
+# CATATAN LANJUTAN (gak diimplementasi di sini, tapi bisa dipakai kalau butuh):
+# - Data jutaan tiang & harus jalan rutin tiap hari -> HDBSCAN bisa berat. Pertimbangkan indeks H3
+#   (resolusi 8-9) buat pra-penyaringan wilayah "hot" dulu, baru HDBSCAN detail di dalamnya.
+# - Ada tiang BARU & gak mau fit ulang semua (ID cluster bisa berubah total kalau di-fit ulang)
+#   -> pakai hdbscan.approximate_predict(clusterer, titik_baru) buat nempelin ke cluster yang sudah ada.
+# ==========================================
