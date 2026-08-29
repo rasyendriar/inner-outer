@@ -56,16 +56,21 @@ CLUSTER_SELECTION_METHOD = 'eom'  # 'eom' -> cluster gede & stabil (dipakai di s
 #                     kasus yang HDBSCAN gak bisa nangkep sendiri: cluster yang PADAT SECARA LOKAL
 #                     (makanya gak kena noise) tapi kepencil jauh dari jaringan padat manapun -- paling
 #                     gampang dipertanggungjawabkan ke tim lapangan krn satuannya konkret (km).
-#  Layer 4 RESCUE JARAK KECIL -> BARU. Titik NOISE (Layer 1) yang jaraknya ke cluster valid manapun
-#                     masih <= JARAK_RESCUE_DEKAT_KM diselamatkan balik jadi Inner. Ini KEBIJAKAN BISNIS
-#                     eksplisit, BUKAN soal kepadatan lagi -- dipakai kalau kamu tetap mau titik yg gak
-#                     padat lokal tapi masih deket (radius kecil) ke jaringan dianggap Inner. Beda sama
-#                     Layer 3: Layer 3 buat cluster PADAT yg kepencil JAUH (>10km), Layer 4 buat titik
-#                     TUNGGAL/NOISE yg deket (radius kecil, default 2km). Set None buat matiin layer ini.
+#  Layer 4 RESCUE - DIAPIT TETANGGA -> BARU. Titik NOISE (Layer 1) yang DIKELILINGI (diapit) minimal
+#                     MIN_TETANGGA_RESCUE tiang non-noise dalam radius JARAK_RESCUE_DEKAT_KM diselamatkan
+#                     balik jadi Inner. SENGAJA pakai JUMLAH tetangga (bukan cuma jarak ke 1 titik
+#                     terdekat) -- titik yg cuma nempel ke SATU titik lain (bisa jadi kebetulan doang)
+#                     beda cerita sama titik yg beneran diapit beberapa tiang (lebih meyakinkan dia
+#                     bagian dari barisan/jaringan). Ini KEBIJAKAN BISNIS eksplisit, BUKAN soal kepadatan
+#                     lagi. Beda sama Layer 3: Layer 3 buat CLUSTER PADAT yg kepencil JAUH (>10km), Layer
+#                     4 buat TITIK TUNGGAL/NOISE yg diapit tetangga dalam radius kecil (default 2km).
+#                     Set salah satu (atau keduanya) None buat matiin layer ini.
 PERSENTIL_OUTLIER_LUNAK = 90
 JARAK_ATURAN_BISNIS_KM = 10.0
 BATAS_MANDIRI_TERISOLASI = 150
 JARAK_RESCUE_DEKAT_KM = 2.0
+MIN_TETANGGA_RESCUE = 2            # minimal berapa tiang valid di sekitar supaya dianggap "diapit"
+                                    # (bukan cuma nempel ke 1 titik doang). Naikkan buat lebih strict.
 
 K_TETANGGA_CORE_DISTANCE = 10     # k tetangga buat "core distance" -- estimator kepadatan lokal murah
                                    # per titik (dari sklearn NearestNeighbors, bukan hdbscan internal),
@@ -269,7 +274,7 @@ def cari_mask_diblokir(df_r, stort_dikecualikan, reg_name):
 def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
                            MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
                            PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI,
-                           K_TETANGGA_CORE_DISTANCE, JARAK_RESCUE_DEKAT_KM=None):
+                           K_TETANGGA_CORE_DISTANCE, JARAK_RESCUE_DEKAT_KM=None, MIN_TETANGGA_RESCUE=None):
     """Jalankan HDBSCAN + kategorisasi 4-lapis untuk 1 subset regional saja.
 
     CATATAN PROYEKSI: jarak dihitung di ruang UTM (meter), BUKAN langsung di derajat lat/lon --
@@ -290,12 +295,17 @@ def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
                       BATAS_MANDIRI_TERISOLASI. Ini WAJIB ada di luar HDBSCAN sendiri, karena HDBSCAN
                       cuma peduli KEPADATAN LOKAL -- cluster yang padat secara lokal tapi kepencil
                       jauh dari jaringan padat manapun TETAP dianggap cluster valid oleh HDBSCAN.
-    Layer 4 RESCUE JARAK KECIL = titik noise (Layer 1) yang jaraknya ke cluster valid manapun masih
-                      <= JARAK_RESCUE_DEKAT_KM diselamatkan balik jadi Inner. PENTING: divalidasi
+    Layer 4 RESCUE - DIAPIT TETANGGA = titik noise (Layer 1) yang DIAPIT (dikelilingi minimal
+                      MIN_TETANGGA_RESCUE tiang non-noise) dalam radius JARAK_RESCUE_DEKAT_KM
+                      diselamatkan balik jadi Inner. SENGAJA pakai JUMLAH tetangga, bukan cuma jarak
+                      ke 1 titik terdekat -- titik yg cuma nempel ke SATU titik (bisa kebetulan doang)
+                      beda cerita sama titik yg beneran diapit beberapa tiang di sekitarnya (lebih
+                      meyakinkan dia bagian dari barisan/jaringan, bukan noise asli). PENTING: divalidasi
                       manual (lihat catatan parameter) -- titik yang keliatan "nempel" ke area padat
                       di plot skala regional itu SERING kali beneran berjarak ratusan meter-beberapa km
-                      (cuma keliatan deket krn plotnya meliputi ratusan km). Jadi ini murni KEBIJAKAN
-                      BISNIS ("masih radius segini dianggap 1 area"), bukan koreksi kepadatan lagi.
+                      (cuma keliatan deket krn plotnya meliputi ratusan km), jadi ini murni KEBIJAKAN
+                      BISNIS ("masih diapit dalam radius segini dianggap 1 area"), bukan koreksi
+                      kepadatan lagi.
     """
     df_r = df_r.reset_index(drop=True)
 
@@ -408,22 +418,28 @@ def analisa_satu_regional(df_r, stort_pilihan, reg_name, stort_dikecualikan,
         ambang_lunak = np.percentile(glosh_scores[kandidat_lunak], PERSENTIL_OUTLIER_LUNAK)
         is_soft_outlier = kandidat_lunak & (glosh_scores >= ambang_lunak)
 
-    # 7. LAYER 4 (RESCUE JARAK KECIL): titik noise yang masih deket (<= JARAK_RESCUE_DEKAT_KM) ke
-    #    cluster valid manapun (root/Sub-Cluster Valid/Soft Outlier -- pokoknya bukan noise) diselamatkan
-    #    balik jadi Inner. KEBIJAKAN BISNIS eksplisit, lihat catatan di docstring & parameter.
+    # 7. LAYER 4 (RESCUE - DIAPIT TETANGGA): titik noise yang DIAPIT (dikelilingi >= MIN_TETANGGA_RESCUE
+    #    tiang non-noise dalam radius JARAK_RESCUE_DEKAT_KM) diselamatkan balik jadi Inner. SENGAJA pakai
+    #    JUMLAH tetangga, bukan cuma jarak ke 1 titik terdekat -- soalnya titik yg cuma nempel ke SATU
+    #    titik lain (mungkin kebetulan doang) beda cerita sama titik yg beneran "diapit" tiang di sekitarnya
+    #    (lebih meyakinkan itu bagian dari barisan/jaringan, bukan noise asli). KEBIJAKAN BISNIS eksplisit,
+    #    lihat catatan di docstring & parameter.
     is_rescued = np.zeros(n, dtype=bool)
-    if JARAK_RESCUE_DEKAT_KM is not None and is_noise.any():
+    if JARAK_RESCUE_DEKAT_KM is not None and MIN_TETANGGA_RESCUE is not None and is_noise.any():
         mask_acuan_rescue = ~is_noise  # semua yg BUKAN noise = acuan "masih deket jaringan"
         if mask_acuan_rescue.any():
             kdt_acuan = KDTree(coords_m[mask_acuan_rescue])
             idx_noise = np.where(is_noise)[0]
             JARAK_RESCUE_M = JARAK_RESCUE_DEKAT_KM * 1000.0
-            d_rescue, _ = kdt_acuan.query(coords_m[idx_noise], k=1)
-            is_rescued[idx_noise[d_rescue <= JARAK_RESCUE_M]] = True
+            jumlah_tetangga = np.array([
+                len(kdt_acuan.query_ball_point(coords_m[i], r=JARAK_RESCUE_M)) for i in idx_noise
+            ])
+            is_rescued[idx_noise[jumlah_tetangga >= MIN_TETANGGA_RESCUE]] = True
     n_rescue = int(is_rescued.sum())
     if n_rescue > 0:
-        print(f"      🔎 Layer 4 (Rescue Jarak Kecil): {n_rescue} tiang noise yang ternyata masih "
-              f"<= {JARAK_RESCUE_DEKAT_KM} km dari cluster valid manapun -> diselamatkan jadi Inner.")
+        print(f"      🔎 Layer 4 (Rescue - Diapit Tetangga): {n_rescue} tiang noise yang ternyata "
+              f"DIAPIT >= {MIN_TETANGGA_RESCUE} tiang valid dalam radius {JARAK_RESCUE_DEKAT_KM} km "
+              f"-> diselamatkan jadi Inner.")
 
     # 8. Gabungin jadi Kategori_Propagasi final
     kategori = np.where(
@@ -458,7 +474,7 @@ for reg in daftar_regional_proses:
         df_r, stort_final[reg], reg, stort_dikecualikan_final[reg],
         MIN_CLUSTER_SIZE, MIN_SAMPLES, CLUSTER_SELECTION_EPSILON_M, CLUSTER_SELECTION_METHOD,
         PERSENTIL_OUTLIER_LUNAK, JARAK_ATURAN_BISNIS_KM, BATAS_MANDIRI_TERISOLASI, K_TETANGGA_CORE_DISTANCE,
-        JARAK_RESCUE_DEKAT_KM
+        JARAK_RESCUE_DEKAT_KM, MIN_TETANGGA_RESCUE
     )
     # cluster_id dibikin unik lintas regional biar gak ketuker pas digabung nanti
     df_r['cluster_id'] = reg + "_" + df_r['cluster_id'].astype(str)
@@ -481,7 +497,7 @@ for reg in daftar_regional_proses:
               f"(GLOSH >= persentil {PERSENTIL_OUTLIER_LUNAK}, tetap Inner tapi ditandai)")
     if n_rescue > 0:
         print(f"   -> Sub-Cluster Valid (Rescue - Dekat Cluster)   : {n_rescue} tiang "
-              f"(noise yg diselamatkan, masih <= {JARAK_RESCUE_DEKAT_KM} km ke cluster valid)")
+              f"(noise yg diselamatkan, diapit >= {MIN_TETANGGA_RESCUE} tiang dlm radius {JARAK_RESCUE_DEKAT_KM} km)")
     print(f"   -> Outlier (Aturan Bisnis - Terisolasi)       : {n_bisnis} tiang")
     print(f"   -> Outlier (Noise - HDBSCAN)                  : {n_noise} tiang")
     if n_invalid > 0:
